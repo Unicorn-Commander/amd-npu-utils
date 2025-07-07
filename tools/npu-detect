@@ -1,0 +1,389 @@
+#!/bin/bash
+
+# npu-detect - AMD NPU Hardware Detection Tool
+# Part of AMD NPU Utils by Unicorn Commander
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Global variables
+VERBOSE=false
+JSON_OUTPUT=false
+TEMP_DIR="/tmp/npu-detect-$$"
+
+show_help() {
+    cat << EOF
+🔍 AMD NPU Detection Tool
+
+USAGE:
+    npu-detect [OPTIONS]
+
+OPTIONS:
+    -v, --verbose       Show detailed information
+    -j, --json         Output in JSON format
+    -h, --help         Show this help message
+
+EXAMPLES:
+    npu-detect                    # Basic detection
+    npu-detect --verbose          # Detailed information
+    npu-detect --json             # JSON output for scripts
+
+EOF
+}
+
+log() {
+    if [[ "$JSON_OUTPUT" == false ]]; then
+        echo -e "${BLUE}[INFO]${NC} $1"
+    fi
+}
+
+success() {
+    if [[ "$JSON_OUTPUT" == false ]]; then
+        echo -e "${GREEN}✅${NC} $1"
+    fi
+}
+
+warn() {
+    if [[ "$JSON_OUTPUT" == false ]]; then
+        echo -e "${YELLOW}⚠️${NC} $1"
+    fi
+}
+
+error() {
+    if [[ "$JSON_OUTPUT" == false ]]; then
+        echo -e "${RED}❌${NC} $1"
+    fi
+}
+
+print_banner() {
+    if [[ "$JSON_OUTPUT" == false ]]; then
+        echo -e "${PURPLE}"
+        cat << "EOF"
+🔍 AMD NPU Detection Report
+═══════════════════════════════════════
+EOF
+        echo -e "${NC}"
+    fi
+}
+
+# Hardware detection functions
+detect_npu_hardware() {
+    local npu_info="{}"
+    
+    # Check for AMD signal processing device
+    if lspci | grep -qi "signal processing.*amd"; then
+        npu_info=$(echo "$npu_info" | jq '. + {"hardware_detected": true}')
+        
+        # Get device details
+        local pci_info=$(lspci | grep -i "signal processing.*amd" | head -1)
+        npu_info=$(echo "$npu_info" | jq --arg info "$pci_info" '. + {"pci_info": $info}')
+        
+        # Determine NPU generation
+        if echo "$pci_info" | grep -qi "phoenix"; then
+            npu_info=$(echo "$npu_info" | jq '. + {"generation": "Phoenix", "architecture": "AIE-ML"}')
+        elif echo "$pci_info" | grep -qi "strix"; then
+            npu_info=$(echo "$npu_info" | jq '. + {"generation": "Strix Point", "architecture": "AIE2"}')
+        else
+            npu_info=$(echo "$npu_info" | jq '. + {"generation": "Unknown", "architecture": "Unknown"}')
+        fi
+        
+        success "NPU Hardware: AMD Ryzen AI ($(echo "$npu_info" | jq -r '.generation'))"
+    else
+        npu_info=$(echo "$npu_info" | jq '. + {"hardware_detected": false}')
+        warn "No AMD NPU hardware detected"
+    fi
+    
+    echo "$npu_info"
+}
+
+detect_npu_driver() {
+    local driver_info="{}"
+    
+    # Check for amdxdna kernel module
+    if lsmod | grep -q "amdxdna"; then
+        driver_info=$(echo "$driver_info" | jq '. + {"driver_loaded": true}')
+        
+        # Get driver version
+        local driver_version=$(modinfo amdxdna 2>/dev/null | grep "^version:" | cut -d: -f2 | xargs || echo "unknown")
+        driver_info=$(echo "$driver_info" | jq --arg ver "$driver_version" '. + {"driver_version": $ver}')
+        
+        success "NPU Driver: amdxdna v$driver_version"
+        
+        # Check device files
+        if [[ -e /dev/accel/accel0 ]]; then
+            driver_info=$(echo "$driver_info" | jq '. + {"device_files": true}')
+            success "Device files: Available"
+        else
+            driver_info=$(echo "$driver_info" | jq '. + {"device_files": false}')
+            warn "Device files: Not found"
+        fi
+        
+    else
+        driver_info=$(echo "$driver_info" | jq '. + {"driver_loaded": false}')
+        error "NPU driver not loaded"
+    fi
+    
+    echo "$driver_info"
+}
+
+detect_xrt_runtime() {
+    local xrt_info="{}"
+    
+    # Check for XRT installation
+    if command -v xrt-smi &> /dev/null; then
+        xrt_info=$(echo "$xrt_info" | jq '. + {"xrt_installed": true}')
+        
+        # Get XRT version
+        local xrt_version=$(xrt-smi examine 2>/dev/null | grep "XRT Version" | cut -d: -f2 | xargs || echo "unknown")
+        xrt_info=$(echo "$xrt_info" | jq --arg ver "$xrt_version" '. + {"xrt_version": $ver}')
+        
+        success "XRT Runtime: $xrt_version"
+        
+        # Test XRT communication
+        if timeout 5 xrt-smi examine &>/dev/null; then
+            xrt_info=$(echo "$xrt_info" | jq '. + {"xrt_functional": true}')
+            success "XRT Communication: OK"
+        else
+            xrt_info=$(echo "$xrt_info" | jq '. + {"xrt_functional": false}')
+            warn "XRT Communication: Failed"
+        fi
+        
+    else
+        xrt_info=$(echo "$xrt_info" | jq '. + {"xrt_installed": false}')
+        warn "XRT Runtime: Not installed"
+    fi
+    
+    echo "$xrt_info"
+}
+
+detect_vitisai() {
+    local vitisai_info="{}"
+    
+    # Check Python availability
+    if command -v python3 &> /dev/null; then
+        # Test VitisAI provider
+        if python3 -c "import onnxruntime; providers = onnxruntime.get_available_providers(); print('VitisAI' if 'VitisAIExecutionProvider' in providers else 'None')" 2>/dev/null | grep -q "VitisAI"; then
+            vitisai_info=$(echo "$vitisai_info" | jq '. + {"vitisai_available": true}')
+            success "VitisAI: Available"
+            
+            # Get VitisAI version if possible
+            local vitisai_version=$(python3 -c "import onnxruntime; print(onnxruntime.__version__)" 2>/dev/null || echo "unknown")
+            vitisai_info=$(echo "$vitisai_info" | jq --arg ver "$vitisai_version" '. + {"vitisai_version": $ver}')
+            
+        else
+            vitisai_info=$(echo "$vitisai_info" | jq '. + {"vitisai_available": false}')
+            warn "VitisAI: Not available"
+        fi
+    else
+        vitisai_info=$(echo "$vitisai_info" | jq '. + {"python_available": false}')
+        warn "Python3: Not available"
+    fi
+    
+    echo "$vitisai_info"
+}
+
+detect_mlir_aie() {
+    local mlir_info="{}"
+    
+    # Check for MLIR-AIE tools
+    if command -v aie-opt &> /dev/null; then
+        mlir_info=$(echo "$mlir_info" | jq '. + {"mlir_aie_available": true}')
+        success "MLIR-AIE: Available"
+        
+        # Get MLIR-AIE path
+        local mlir_path=$(which aie-opt | sed 's|/bin/aie-opt||')
+        mlir_info=$(echo "$mlir_info" | jq --arg path "$mlir_path" '. + {"mlir_aie_path": $path}')
+        
+    else
+        mlir_info=$(echo "$mlir_info" | jq '. + {"mlir_aie_available": false}')
+        warn "MLIR-AIE: Not available"
+    fi
+    
+    echo "$mlir_info"
+}
+
+get_npu_capabilities() {
+    local capabilities="{}"
+    
+    # Check NPU specifications based on detected hardware
+    if lspci | grep -qi "phoenix"; then
+        capabilities=$(echo "$capabilities" | jq '. + {
+            "max_frequency": "1.3 GHz",
+            "tile_memory": "32MB",
+            "compute_units": 4,
+            "int8_support": true,
+            "fp16_support": true,
+            "architecture": "AIE-ML"
+        }')
+    elif lspci | grep -qi "strix"; then
+        capabilities=$(echo "$capabilities" | jq '. + {
+            "max_frequency": "1.6 GHz", 
+            "tile_memory": "64MB",
+            "compute_units": 8,
+            "int8_support": true,
+            "fp16_support": true,
+            "architecture": "AIE2"
+        }')
+    fi
+    
+    echo "$capabilities"
+}
+
+assess_optimization_level() {
+    local hardware_score=0
+    local driver_score=0
+    local runtime_score=0
+    local total_score=0
+    
+    # Hardware detection (25 points)
+    if lspci | grep -qi "signal processing.*amd"; then
+        hardware_score=25
+    fi
+    
+    # Driver status (25 points)
+    if lsmod | grep -q "amdxdna" && [[ -e /dev/accel/accel0 ]]; then
+        driver_score=25
+    fi
+    
+    # Runtime components (50 points)
+    local runtime_components=0
+    
+    # XRT (15 points)
+    if command -v xrt-smi &> /dev/null && timeout 5 xrt-smi examine &>/dev/null; then
+        runtime_components=$((runtime_components + 15))
+    fi
+    
+    # VitisAI (20 points)
+    if python3 -c "import onnxruntime; 'VitisAIExecutionProvider' in onnxruntime.get_available_providers()" 2>/dev/null; then
+        runtime_components=$((runtime_components + 20))
+    fi
+    
+    # MLIR-AIE (15 points)
+    if command -v aie-opt &> /dev/null; then
+        runtime_components=$((runtime_components + 15))
+    fi
+    
+    runtime_score=$runtime_components
+    total_score=$((hardware_score + driver_score + runtime_score))
+    
+    # Determine optimization level
+    local optimization_level="Not Optimized"
+    local status_color="$RED"
+    
+    if [[ $total_score -ge 90 ]]; then
+        optimization_level="Fully Optimized"
+        status_color="$GREEN"
+    elif [[ $total_score -ge 70 ]]; then
+        optimization_level="Well Optimized"
+        status_color="$GREEN"
+    elif [[ $total_score -ge 50 ]]; then
+        optimization_level="Partially Optimized"
+        status_color="$YELLOW"
+    elif [[ $total_score -ge 25 ]]; then
+        optimization_level="Basic Setup"
+        status_color="$YELLOW"
+    fi
+    
+    if [[ "$JSON_OUTPUT" == false ]]; then
+        echo
+        echo -e "${CYAN}🎯 Optimization Level: ${status_color}${optimization_level}${NC} (${total_score}/100)"
+    fi
+    
+    echo "{\"optimization_level\": \"$optimization_level\", \"score\": $total_score, \"max_score\": 100}"
+}
+
+# Main detection function
+run_detection() {
+    mkdir -p "$TEMP_DIR"
+    
+    local results="{}"
+    
+    # Detect hardware
+    local hardware_info=$(detect_npu_hardware)
+    results=$(echo "$results" | jq --argjson hw "$hardware_info" '. + {"hardware": $hw}')
+    
+    # Detect driver
+    local driver_info=$(detect_npu_driver)
+    results=$(echo "$results" | jq --argjson drv "$driver_info" '. + {"driver": $drv}')
+    
+    # Detect XRT
+    local xrt_info=$(detect_xrt_runtime)
+    results=$(echo "$results" | jq --argjson xrt "$xrt_info" '. + {"xrt": $xrt}')
+    
+    # Detect VitisAI
+    local vitisai_info=$(detect_vitisai)
+    results=$(echo "$results" | jq --argjson vai "$vitisai_info" '. + {"vitisai": $vai}')
+    
+    # Detect MLIR-AIE
+    local mlir_info=$(detect_mlir_aie)
+    results=$(echo "$results" | jq --argjson mlir "$mlir_info" '. + {"mlir_aie": $mlir}')
+    
+    # Get capabilities
+    local capabilities=$(get_npu_capabilities)
+    results=$(echo "$results" | jq --argjson caps "$capabilities" '. + {"capabilities": $caps}')
+    
+    # Assess optimization
+    local optimization=$(assess_optimization_level)
+    results=$(echo "$results" | jq --argjson opt "$optimization" '. + {"optimization": $opt}')
+    
+    if [[ "$JSON_OUTPUT" == true ]]; then
+        echo "$results" | jq .
+    else
+        if [[ "$VERBOSE" == true ]]; then
+            echo
+            echo -e "${CYAN}📊 NPU Capabilities:${NC}"
+            if [[ $(echo "$capabilities" | jq -r '.max_frequency // empty') ]]; then
+                echo "   - Max Frequency: $(echo "$capabilities" | jq -r '.max_frequency')"
+                echo "   - Tile Memory: $(echo "$capabilities" | jq -r '.tile_memory')"
+                echo "   - Compute Units: $(echo "$capabilities" | jq -r '.compute_units')"
+                echo "   - INT8 Quantization: $(echo "$capabilities" | jq -r '.int8_support')"
+                echo "   - FP16 Precision: $(echo "$capabilities" | jq -r '.fp16_support')"
+            else
+                echo "   - Capabilities unknown (hardware not detected)"
+            fi
+        fi
+    fi
+    
+    rm -rf "$TEMP_DIR"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -j|--json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Check for required tools
+if ! command -v jq &> /dev/null; then
+    error "jq is required but not installed. Please install jq."
+    exit 1
+fi
+
+# Run detection
+print_banner
+run_detection
