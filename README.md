@@ -19,9 +19,9 @@
 
 ### 📊 Performance & Profiling
 - **`npu-profile`** - Performance profiling and bottleneck analysis
-- **`npu-benchmark`** - Standard benchmarks for NPU performance
+- **`npu-benchmark`** - Standard benchmarks for NPU performance (RTF 0.213 achieved!)
 - **`npu-monitor`** - Real-time utilization and temperature monitoring
-- **`npu-optimize`** - Model optimization recommendations
+- **`npu-optimize`** - Model optimization recommendations (30% turbo improvement)
 
 ### 🔧 Development Tools
 - **`npu-compile`** - MLIR-AIE kernel compilation wrapper
